@@ -308,7 +308,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     async def generate():
         tool_was_called = False
-        filler_sent = False
+        llm_text_streamed = False  # Track if LLM has streamed any text (filler)
         
         # Log file for debugging
         with open('/tmp/strands_debug.log', 'a') as f:
@@ -319,51 +319,44 @@ async def chat_completions(request: ChatCompletionRequest):
             async for event in strands_agent.stream_async(user_message):
                 event_keys = list(event.keys()) if isinstance(event, dict) else []
                 
+                # DEBUG: Log ALL events to find tool initiation pattern
+                with open('/tmp/strands_debug.log', 'a') as f:
+                    event_str = str(event)[:300] if isinstance(event, dict) else str(type(event))
+                    f.write(f"[EVENT] T+{elapsed_ms()}ms | keys={event_keys} | {event_str}\n")
+                
                 # ===== DETECT TOOL CALL =====
+                # Based on actual Strands events, we detect:
+                # 1. contentBlockStart with toolUse (first signal)
+                # 2. type == 'tool_use_stream' (subsequent signals)
                 is_tool_init = False
                 tool_name = None
                 
                 if isinstance(event, dict):
-                    if "tool_use" in event:
+                    # Pattern 1: contentBlockStart with toolUse (FIRST signal at ~1.4s)
+                    inner_event = event.get("event", {})
+                    if isinstance(inner_event, dict):
+                        content_block_start = inner_event.get("contentBlockStart", {})
+                        if isinstance(content_block_start, dict):
+                            start_data = content_block_start.get("start", {})
+                            if isinstance(start_data, dict) and "toolUse" in start_data:
+                                is_tool_init = True
+                                tool_name = start_data["toolUse"].get("name")
+                    
+                    # Pattern 2: type == 'tool_use_stream' (subsequent tool streaming)
+                    if not is_tool_init and event.get("type") == "tool_use_stream":
                         is_tool_init = True
-                        tool_info = event.get("tool_use", {})
-                        tool_name = tool_info.get("name") if isinstance(tool_info, dict) else None
-                    elif "init_tool_use" in event:
-                        is_tool_init = True
-                        tool_info = event.get("init_tool_use", {})
-                        tool_name = tool_info.get("name") if isinstance(tool_info, dict) else None
-                    elif event.get("type") in ("tool_use", "function_call", "tool_call"):
-                        is_tool_init = True
-                        tool_name = event.get("name") or event.get("function", {}).get("name")
-                    elif "content_block" in event:
-                        block = event.get("content_block", {})
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            is_tool_init = True
-                            tool_name = block.get("name")
+                        current_tool = event.get("current_tool_use", {})
+                        if isinstance(current_tool, dict):
+                            tool_name = current_tool.get("name")
                 
-                # ===== SEND FILLER IMMEDIATELY ON TOOL DETECTION =====
-                if is_tool_init and not filler_sent:
+                # ===== TOOL CALL DETECTED =====
+                # Per Jan 13 meeting: Filler must come from LLM, not hardcoded.
+                # The LLM's filler text is already streamed via 'data' events BEFORE this point.
+                # We just mark that a tool was called to block LLM rephrasing after tool result.
+                if is_tool_init:
                     tool_was_called = True
-                    filler_sent = True
-                    
-                    # Contextual filler based on tool (comes from Strands, not hardcoded in LiveKit)
-                    TOOL_FILLERS = {
-                        "get_weather": "Let me check the weather for you.",
-                        "get_current_time": "Let me check the time.",
-                        "calculate": "Let me calculate that.",
-                        "set_reminder": "Setting that reminder for you.",
-                    }
-                    filler_text = TOOL_FILLERS.get(tool_name, "One moment please.")
-                    
                     with open('/tmp/strands_debug.log', 'a') as f:
-                        f.write(f"[FILLER SENT] T+{elapsed_ms()}ms | tool={tool_name} | '{filler_text}'\n")
-                    
-                    # Send filler immediately - no buffering
-                    yield f"data: {json.dumps(make_chunk(filler_text))}\n\n"
-                    await asyncio.sleep(0)  # Force flush
-                    
-                elif is_tool_init:
-                    tool_was_called = True
+                        f.write(f"[TOOL DETECTED] T+{elapsed_ms()}ms | tool={tool_name} | (LLM filler already streamed)\n")
                 
                 # ===== TOOL RESULT (comes after natural pause from tool execution) =====
                 if "tool_stream_event" in event:
@@ -376,19 +369,23 @@ async def chat_completions(request: ChatCompletionRequest):
                         await asyncio.sleep(0)
                     continue
                 
-                # ===== LLM TEXT (normal response or filler from LLM) =====
+                # ===== LLM TEXT (filler before tool, or normal response) =====
+                # Per Jan 13 meeting: LLM outputs filler as text BEFORE tool call.
+                # This text is streamed immediately - no hardcoded fillers.
                 if "data" in event:
                     data = event["data"]
                     if data:
-                        # If tool was called and filler sent, block LLM rephrasing
-                        if tool_was_called and filler_sent:
+                        # If tool was already called, block LLM's post-tool rephrasing
+                        # (the tool result speaks for itself)
+                        if tool_was_called and llm_text_streamed:
                             with open('/tmp/strands_debug.log', 'a') as f:
                                 f.write(f"[BLOCKED] T+{elapsed_ms()}ms | '{data[:30]}...'\n")
                             continue
                         
-                        # Normal LLM text - stream it
+                        # Stream LLM text immediately (this IS the filler from LLM!)
+                        llm_text_streamed = True
                         with open('/tmp/strands_debug.log', 'a') as f:
-                            f.write(f"[LLM TEXT] T+{elapsed_ms()}ms | '{data}'\n")
+                            f.write(f"[LLM FILLER] T+{elapsed_ms()}ms | '{data}'\n")
                         yield f"data: {json.dumps(make_chunk(data))}\n\n"
                         await asyncio.sleep(0)
                     continue
