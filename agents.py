@@ -15,7 +15,13 @@ from strands.models.openai import OpenAIModel
 
 load_dotenv()
 
+# Configure logging to show our debug messages
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 app = FastAPI(title="Strands Agent Server", version="1.0.0")
 
@@ -31,7 +37,7 @@ model = OpenAIModel(
 )
 
 # ============================================
-# TOOLS WITH STREAMING FILLERS
+# TOOLS (No fillers - LLM sends filler as text content before calling)
 # ============================================
 
 @tool
@@ -41,8 +47,8 @@ async def get_weather(city: str) -> str:
     Args:
         city: The city to get weather for (e.g., "Delhi", "Tokyo", "New York")
     """
-    # Stream filler immediately (with line break for visual separation)
-    yield f"Let me check the weather in {city} for you... one moment.\n\n"
+    # NOTE: Filler is now sent by LLM as text content BEFORE this tool executes
+    # This ensures filler arrives within <1 second (LLM decision time, not tool execution time)
     
     try:
         async with httpx.AsyncClient() as client:
@@ -103,7 +109,7 @@ async def get_weather(city: str) -> str:
 @tool
 async def get_current_time() -> str:
     """Get the current date and time."""
-    yield "Let me check the time for you...\n\n"
+    # Filler comes from LLM text, not here
     now = datetime.now()
     yield f"The current date and time is {now.strftime('%A, %B %d, %Y at %I:%M %p')}"
 
@@ -115,7 +121,7 @@ async def calculate(expression: str) -> str:
     Args:
         expression: A mathematical expression to evaluate (e.g., "2 + 2", "10 * 5")
     """
-    yield "Let me calculate that for you...\n\n"
+    # Filler comes from LLM text, not here
     try:
         allowed_chars = set("0123456789+-*/.() ")
         if not all(c in allowed_chars for c in expression):
@@ -135,7 +141,7 @@ async def set_reminder(reminder_text: str, minutes: int) -> str:
         reminder_text: What to be reminded about
         minutes: How many minutes from now to be reminded
     """
-    yield f"Setting that reminder for you...\n\n"
+    # Filler comes from LLM text, not here
     yield f"I've set a reminder for you in {minutes} minutes: '{reminder_text}'"
 
 
@@ -148,6 +154,18 @@ strands_agent = Agent(
 - get_current_time: Get the current date and time
 - calculate: Evaluate math expressions
 - set_reminder: Set reminders for the user
+
+CRITICAL FILLER REQUIREMENT:
+When you decide to use ANY tool, you MUST FIRST output a brief, natural filler phrase as your text response BEFORE calling the tool.
+This filler phrase will be spoken to the user immediately while the tool executes.
+
+Examples of good filler phrases (vary them naturally):
+- "Let me check that for you."
+- "One moment, I'll look that up."
+- "Sure, let me find that information."
+- "Checking that now..."
+
+The filler MUST be your text output, NOT part of the tool call.
 
 IMPORTANT: When a tool returns a result, DO NOT repeat or rephrase the information.
 The tool output is already spoken to the user. Just add a brief friendly comment if needed.
@@ -261,17 +279,25 @@ async def stream_response(request: InvocationRequest):
 @app.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """
-    OpenAI-compatible chat completions endpoint with proper filler + pause streaming.
+    OpenAI-compatible chat completions endpoint with IMMEDIATE filler streaming.
     
-    Flow:
-    1. Tool filler streams immediately ("Let me check the weather...")
-    2. PAUSE (1.5 seconds) - creates audible gap
-    3. Tool result streams ("The weather is 24°C...")
-    4. LLM rephrase is BLOCKED (to prevent double response)
+    SIMPLIFIED FLOW (per Jan 13 meeting):
+    1. User query arrives
+    2. LLM decides to call tool → Send filler IMMEDIATELY (< 1 second)
+    3. Tool executes (natural pause - this is the 2-5 second wait)
+    4. Tool result streams to user
+    
+    The pause between filler and response is NATURAL (tool execution time).
+    No artificial delays or SSML needed.
     """
+    import time
+    start_time = time.time()
+    
     user_message = request.messages[-1].get("content", "")
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    logger.info(f"[STRANDS] Received: {user_message}")
+    
+    def elapsed_ms():
+        return int((time.time() - start_time) * 1000)
     
     def make_chunk(content: str, finish_reason=None):
         return {
@@ -282,56 +308,106 @@ async def chat_completions(request: ChatCompletionRequest):
     
     async def generate():
         tool_was_called = False
-        tool_stream_count = 0
+        filler_sent = False
+        
+        # Log file for debugging
+        with open('/tmp/strands_debug.log', 'a') as f:
+            f.write(f"\n{'='*50}\n")
+            f.write(f"[NEW REQUEST] T+0ms | {user_message}\n")
         
         try:
             async for event in strands_agent.stream_async(user_message):
-                logger.info(f"[EVENT] {event}")
+                event_keys = list(event.keys()) if isinstance(event, dict) else []
                 
-                # TOOL STREAMING - this is where filler + result come from
+                # ===== DETECT TOOL CALL =====
+                is_tool_init = False
+                tool_name = None
+                
+                if isinstance(event, dict):
+                    if "tool_use" in event:
+                        is_tool_init = True
+                        tool_info = event.get("tool_use", {})
+                        tool_name = tool_info.get("name") if isinstance(tool_info, dict) else None
+                    elif "init_tool_use" in event:
+                        is_tool_init = True
+                        tool_info = event.get("init_tool_use", {})
+                        tool_name = tool_info.get("name") if isinstance(tool_info, dict) else None
+                    elif event.get("type") in ("tool_use", "function_call", "tool_call"):
+                        is_tool_init = True
+                        tool_name = event.get("name") or event.get("function", {}).get("name")
+                    elif "content_block" in event:
+                        block = event.get("content_block", {})
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            is_tool_init = True
+                            tool_name = block.get("name")
+                
+                # ===== SEND FILLER IMMEDIATELY ON TOOL DETECTION =====
+                if is_tool_init and not filler_sent:
+                    tool_was_called = True
+                    filler_sent = True
+                    
+                    # Contextual filler based on tool (comes from Strands, not hardcoded in LiveKit)
+                    TOOL_FILLERS = {
+                        "get_weather": "Let me check the weather for you.",
+                        "get_current_time": "Let me check the time.",
+                        "calculate": "Let me calculate that.",
+                        "set_reminder": "Setting that reminder for you.",
+                    }
+                    filler_text = TOOL_FILLERS.get(tool_name, "One moment please.")
+                    
+                    with open('/tmp/strands_debug.log', 'a') as f:
+                        f.write(f"[FILLER SENT] T+{elapsed_ms()}ms | tool={tool_name} | '{filler_text}'\n")
+                    
+                    # Send filler immediately - no buffering
+                    yield f"data: {json.dumps(make_chunk(filler_text))}\n\n"
+                    await asyncio.sleep(0)  # Force flush
+                    
+                elif is_tool_init:
+                    tool_was_called = True
+                
+                # ===== TOOL RESULT (comes after natural pause from tool execution) =====
                 if "tool_stream_event" in event:
                     data = event["tool_stream_event"].get("data")
                     if data:
                         tool_was_called = True
-                        tool_stream_count += 1
-                        
-                        # Stream the content
-                        logger.info(f"[TOOL #{tool_stream_count}] {data[:50]}...")
+                        with open('/tmp/strands_debug.log', 'a') as f:
+                            f.write(f"[TOOL RESULT] T+{elapsed_ms()}ms | '{data[:50]}...'\n")
                         yield f"data: {json.dumps(make_chunk(data))}\n\n"
-                        
-                        # After FIRST tool stream (the filler), add PAUSE
-                        if tool_stream_count == 1:
-                            logger.info("[PAUSE] Adding 3s gap after filler...")
-                            await asyncio.sleep(3.0)
-                        else:
-                            await asyncio.sleep(0)
+                        await asyncio.sleep(0)
+                    continue
                 
-                # LLM RESPONSE - only allow if NO tool was called
-                elif "data" in event:
+                # ===== LLM TEXT (normal response or filler from LLM) =====
+                if "data" in event:
                     data = event["data"]
                     if data:
-                        if tool_was_called:
-                            # BLOCK LLM rephrase when tool was used
-                            logger.info(f"[BLOCKED] LLM rephrase: {data[:50]}...")
+                        # If tool was called and filler sent, block LLM rephrasing
+                        if tool_was_called and filler_sent:
+                            with open('/tmp/strands_debug.log', 'a') as f:
+                                f.write(f"[BLOCKED] T+{elapsed_ms()}ms | '{data[:30]}...'\n")
                             continue
-                        else:
-                            # Normal LLM response (no tool involved)
-                            logger.info(f"[LLM] {data[:50]}...")
-                            yield f"data: {json.dumps(make_chunk(data))}\n\n"
-                            await asyncio.sleep(0)
+                        
+                        # Normal LLM text - stream it
+                        with open('/tmp/strands_debug.log', 'a') as f:
+                            f.write(f"[LLM TEXT] T+{elapsed_ms()}ms | '{data}'\n")
+                        yield f"data: {json.dumps(make_chunk(data))}\n\n"
+                        await asyncio.sleep(0)
+                    continue
                 
-                # Delta format (fallback)
-                elif "delta" in event:
-                    content = event["delta"].get("content")
+                # ===== FALLBACK: Delta format =====
+                if "delta" in event:
+                    content = event.get("delta", {}).get("content") if isinstance(event.get("delta"), dict) else None
                     if content and not tool_was_called:
                         yield f"data: {json.dumps(make_chunk(content))}\n\n"
                         await asyncio.sleep(0)
             
+            with open('/tmp/strands_debug.log', 'a') as f:
+                f.write(f"[DONE] T+{elapsed_ms()}ms\n")
             yield f"data: {json.dumps(make_chunk('', finish_reason='stop'))}\n\n"
             yield "data: [DONE]\n\n"
                 
         except Exception as e:
-            logger.error(f"[ERROR] {e}")
+            with open('/tmp/strands_debug.log', 'a') as f:
+                f.write(f"[ERROR] T+{elapsed_ms()}ms | {e}\n")
             yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -343,4 +419,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    print("=" * 50)
+    print("STRANDS SERVER STARTING - DEBUG MODE v2")
+    print("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=8080)
