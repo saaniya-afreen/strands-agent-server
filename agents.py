@@ -352,11 +352,24 @@ async def chat_completions(request: ChatCompletionRequest):
                 # ===== TOOL CALL DETECTED =====
                 # Per Jan 13 meeting: Filler must come from LLM, not hardcoded.
                 # The LLM's filler text is already streamed via 'data' events BEFORE this point.
-                # We just mark that a tool was called to block LLM rephrasing after tool result.
-                if is_tool_init:
+                # 
+                # KEY FIX: When tool is detected, force-flush the filler by sending finish signal.
+                # This ensures TTS speaks the filler BEFORE tool result arrives.
+                if is_tool_init and not tool_was_called:
                     tool_was_called = True
                     with open('/tmp/strands_debug.log', 'a') as f:
-                        f.write(f"[TOOL DETECTED] T+{elapsed_ms()}ms | tool={tool_name} | (LLM filler already streamed)\n")
+                        f.write(f"[TOOL DETECTED] T+{elapsed_ms()}ms | tool={tool_name} | FORCING FILLER FLUSH\n")
+                    
+                    # Force flush: Send finish signal to make TTS speak filler immediately
+                    # This creates a natural break before tool result
+                    if llm_text_streamed:
+                        yield f"data: {json.dumps(make_chunk('', finish_reason='tool_calls'))}\n\n"
+                        await asyncio.sleep(0)
+                        with open('/tmp/strands_debug.log', 'a') as f:
+                            f.write(f"[FILLER FLUSHED] T+{elapsed_ms()}ms | finish_reason=tool_calls sent\n")
+                elif is_tool_init:
+                    # Already detected tool, skip duplicate detection
+                    pass
                 
                 # ===== TOOL RESULT (comes after natural pause from tool execution) =====
                 if "tool_stream_event" in event:
